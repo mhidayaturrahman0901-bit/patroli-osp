@@ -11,11 +11,10 @@ st.set_page_config(page_title="Portal Patroli OSP Indosat", page_icon="🛡️",
 def load_data():
     try:
         df = pd.read_excel("GPSFIBEROP.xlsx")
-        # Membersihkan nama kolom dari spasi tambahan
         df.columns = df.columns.str.strip()
         return df
     except Exception as e:
-        st.error(f"Gagal memuat file Excel: {e}")
+        st.error(f"Gagal memuat file database: {e}")
         return None
 
 # Fungsi untuk mencatat log upload ke Excel
@@ -35,7 +34,6 @@ def save_to_log(pilihan, bulan, file_name):
         pd.concat([old_df, new_entry], ignore_index=True).to_excel(log_file, index=False)
 
 # --- SIDEBAR NAVIGASI ---
-st.sidebar.image("https://upload.wikimedia.org/wikipedia/commons/a/ac/Indosat_Ooredoo_Hutchison_logo.svg", width=150) # Opsional: Logo Indosat
 st.sidebar.title("⚙️ Control Panel")
 menu = st.sidebar.radio("Pilih Halaman:", ["📤 Upload Vendor", "📊 Admin Panel (Cek Data)"])
 
@@ -45,7 +43,7 @@ if df_master is not None:
     # --- HALAMAN 1: UPLOAD VENDOR ---
     if menu == "📤 Upload Vendor":
         st.title("🛡️ Portal Pengiriman Laporan Patroli OSP")
-        st.info("Silakan pilih bulan, segmen, dan unggah file PDF laporan Anda.")
+        st.info("Pilih bulan dan segmen dengan benar sebelum mengunggah file PDF.")
 
         with st.form("form_upload", clear_on_submit=True):
             # Input 1: Pilih Segmen
@@ -64,78 +62,87 @@ if df_master is not None:
             
             if submit:
                 if file_pdf:
-                    # Buat folder uploads jika belum ada
                     if not os.path.exists("uploads"):
                         os.makedirs("uploads")
                     
-                    # Buat nama file unik: LAPORAN_BULAN_SEGMEN.pdf
+                    # Format nama file: LAPORAN_BULAN_SEGMEN.pdf
                     nama_file_bersih = pilihan_segmen.replace(" ", "_").replace("/", "-")
                     fname = f"LAPORAN_{pilihan_bulan.upper()}_{nama_file_bersih}.pdf"
                     path_simpan = os.path.join("uploads", fname)
                     
-                    # CEK DUPLIKAT
+                    # CEK DUPLIKAT (Mencegah upload ulang di bulan yang sama)
                     if os.path.exists(path_simpan):
-                        st.error(f"❌ GAGAL: Laporan bulan {pilihan_bulan} untuk segmen ini sudah ada di server!")
+                        st.error(f"❌ GAGAL: Laporan bulan {pilihan_bulan} untuk segmen ini sudah ada!")
                     else:
                         with open(path_simpan, "wb") as f:
                             f.write(file_pdf.getbuffer())
                         save_to_log(pilihan_segmen, pilihan_bulan, fname)
-                        st.success(f"✅ Berhasil! Laporan {pilihan_bulan} untuk {pilihan_segmen} telah tersimpan.")
+                        st.success(f"✅ Berhasil Terkirim!")
                         st.balloons()
                 else:
-                    st.error("⚠️ Mohon pilih file PDF terlebih dahulu!")
+                    st.error("⚠️ File PDF wajib dilampirkan!")
 
-    # --- HALAMAN 2: ADMIN PANEL ---
+    # --- HALAMAN 2: ADMIN PANEL (DENGAN PASSWORD) ---
     elif menu == "📊 Admin Panel (Cek Data)":
-        st.title("📊 Dashboard Monitoring Admin")
+        st.title("🔐 Akses Admin Terbatas")
         
-        # Tombol Reset Tabel (Hanya jika file Excel log ada)
-        if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
-            if st.sidebar.button("🗑️ Reset Tabel Rekap"):
-                os.remove("REKAP_UPLOAD_VENDOR.xlsx")
-                st.rerun()
-
-        # Menampilkan Tabel Rekap dengan Filter Bulan
-        if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
-            rekap_df = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
-            
-            st.subheader("🔍 Filter & Cari Data")
-            filter_bulan = st.selectbox("Filter Tampilan Berdasarkan Bulan:", 
-                                       ["Semua Bulan"] + ["Januari", "Februari", "Maret", "April", "Mei", "Juni", 
-                                                        "Juli", "Agustus", "September", "Oktober", "November", "Desember"])
-            
-            if filter_bulan != "Semua Bulan":
-                df_tampil = rekap_df[rekap_df['BULAN_LAPORAN'] == filter_bulan]
-            else:
-                df_tampil = rekap_df
-
-            st.dataframe(df_tampil, use_container_width=True, hide_index=True)
-            
+        # INPUT PASSWORD
+        password_input = st.text_input("Masukkan Password Admin:", type="password")
+        
+        if password_input == "indosat2024":
+            st.success("Akses Diterima!")
             st.markdown("---")
-            st.subheader(f"📁 Manajemen File PDF ({filter_bulan})")
             
-            if not df_tampil.empty:
-                for index, row in df_tampil.iterrows():
-                    f_name = row['FILE_NAME']
-                    f_path = os.path.join("uploads", f_name)
-                    
-                    if os.path.exists(f_path):
-                        col1, col2, col3 = st.columns([3, 1, 1])
-                        with col1:
-                            st.write(f"📄 {f_name}")
-                        with col2:
-                            with open(f_path, "rb") as f_data:
-                                st.download_button("Download", data=f_data, file_name=f_name, key=f"dl_{index}")
-                        with col3:
-                            if st.button("Hapus", key=f"del_{index}"):
-                                os.remove(f_path)
-                                st.rerun()
-                    else:
-                        st.warning(f"File {f_name} sudah tidak ada di folder uploads.")
+            # FITUR RESET REKAP DI SIDEBAR
+            if st.sidebar.button("🗑️ Reset Semua Rekap Tabel"):
+                if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
+                    os.remove("REKAP_UPLOAD_VENDOR.xlsx")
+                    st.rerun()
+
+            # TAMPILKAN TABEL REKAP
+            if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
+                rekap_df = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
+                
+                # FILTER BULAN
+                st.subheader("🔍 Filter Data Laporan")
+                bulan_pilihan = ["Semua Bulan", "Januari", "Februari", "Maret", "April", "Mei", "Juni", 
+                                 "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+                filter_bln = st.selectbox("Tampilkan laporan bulan:", options=bulan_pilihan)
+                
+                if filter_bln != "Semua Bulan":
+                    df_final = rekap_df[rekap_df['BULAN_LAPORAN'] == filter_bln]
+                else:
+                    df_final = rekap_df
+
+                st.dataframe(df_final, use_container_width=True, hide_index=True)
+                
+                st.markdown("---")
+                st.subheader(f"📁 Manajemen File ({filter_bln})")
+                
+                # DAFTAR FILE DAN TOMBOL HAPUS
+                if not df_final.empty:
+                    for index, row in df_final.iterrows():
+                        f_name = row['FILE_NAME']
+                        f_path = os.path.join("uploads", f_name)
+                        
+                        if os.path.exists(f_path):
+                            c1, c2, c3 = st.columns([3, 1, 1])
+                            with c1:
+                                st.write(f"📄 {f_name}")
+                            with c2:
+                                with open(f_path, "rb") as fl:
+                                    st.download_button("Lihat", data=fl, file_name=f_name, key=f"dl_{index}")
+                            with c3:
+                                if st.button("Hapus", key=f"del_{index}"):
+                                    os.remove(f_path)
+                                    st.rerun()
+                else:
+                    st.info(f"Tidak ada file untuk bulan {filter_bln}")
             else:
-                st.info(f"Tidak ada file PDF untuk bulan {filter_bulan}.")
-        else:
-            st.info("Belum ada data upload yang masuk.")
+                st.info("Belum ada data upload yang masuk.")
+                
+        elif password_input != "":
+            st.error("Password Salah! Akses ditolak.")
 
 else:
-    st.error("Sistem Error: File GPSFIBEROP.xlsx tidak ditemukan di repository GitHub Anda.")
+    st.error("File GPSFIBEROP.xlsx tidak ditemukan. Pastikan file ada di GitHub.")
