@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import os
-import base64
 from datetime import datetime
 
 # 1. Konfigurasi Halaman
@@ -31,13 +30,6 @@ def save_to_log(pilihan, file_name):
         old_df = pd.read_excel(log_file)
         pd.concat([old_df, new_entry], ignore_index=True).to_excel(log_file, index=False)
 
-# Fungsi untuk menampilkan PDF
-def displayPDF(file):
-    with open(file, "rb") as f:
-        base64_pdf = base64.b64encode(f.read()).decode('utf-8')
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
-
 # --- MENU NAVIGASI ---
 st.sidebar.title("⚙️ Control Panel")
 menu = st.sidebar.radio("Pilih Halaman:", ["Upload Vendor", "Admin Panel (Cek Data)"])
@@ -47,7 +39,7 @@ df = load_data()
 if df is not None:
     if menu == "Upload Vendor":
         st.title("🛡️ Portal Pengiriman Laporan Patroli OSP")
-        st.info("Silakan pilih segmen dan unggah file PDF Timemark Anda.")
+        st.info("Pilih segmen dan unggah file PDF Timemark Anda.")
         
         st.dataframe(df[['NO', 'AREA', 'SEGMENT NAME']], use_container_width=True, hide_index=True)
 
@@ -60,42 +52,43 @@ if df is not None:
                 if file_pdf:
                     if not os.path.exists("uploads"): os.makedirs("uploads")
                     fname = f"LAPORAN_{pilihan_final.replace(' ', '_')}.pdf"
-                    path_simpan = os.path.join("uploads", fname)
-                    with open(path_simpan, "wb") as f:
+                    with open(os.path.join("uploads", fname), "wb") as f:
                         f.write(file_pdf.getbuffer())
                     save_to_log(pilihan_final, fname)
-                    st.success(f"✅ Berhasil Terkirim!")
+                    st.success(f"✅ Berhasil! Laporan tersimpan.")
                     st.balloons()
                 else:
-                    st.error("⚠️ Pilih file PDF dulu!")
+                    st.error("⚠️ Lampirkan file PDF!")
 
     elif menu == "Admin Panel (Cek Data)":
-        st.title("📊 Data Masuk & Pratinjau Foto")
+        st.title("📊 Data Masuk & Review Laporan")
         if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
             rekap_df = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
             st.dataframe(rekap_df, use_container_width=True)
             
             st.markdown("---")
+            st.subheader("📁 Review & Download Foto")
             
-            # FITUR PREVIEW
             if os.path.exists("uploads"):
-                list_files = [f for f in os.listdir("uploads") if f.endswith('.pdf')]
-                if list_files:
-                    st.subheader("🔍 Intip Isi Laporan (Foto)")
-                    file_terpilih = st.selectbox("Pilih file yang mau dilihat:", list_files)
-                    
-                    col1, col2 = st.columns([1, 3])
-                    with col1:
-                        path_file = os.path.join("uploads", file_terpilih)
-                        with open(path_file, "rb") as f:
-                            st.download_button("📥 Download File Ini", data=f, file_name=file_terpilih)
-                    
-                    with col2:
-                        st.write(f"Menampilkan: {file_terpilih}")
-                        displayPDF(path_file)
+                files = [f for f in os.listdir("uploads") if f.endswith('.pdf')]
+                if files:
+                    # Menampilkan daftar file dengan tombol yang jelas
+                    for f in files:
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.write(f"📄 {f}")
+                        with col2:
+                            with open(os.path.join("uploads", f), "rb") as file_data:
+                                st.download_button(
+                                    label="Lihat / Download",
+                                    data=file_data,
+                                    file_name=f,
+                                    key=f,
+                                    mime="application/pdf"
+                                )
                 else:
-                    st.warning("Belum ada file PDF untuk dilihat.")
+                    st.warning("Belum ada file di server.")
         else:
-            st.info("Belum ada aktivitas upload.")
+            st.info("Belum ada data upload.")
 else:
-    st.error("File database tidak ditemukan!")
+    st.error("Database tidak ditemukan!")
