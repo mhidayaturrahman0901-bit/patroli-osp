@@ -5,7 +5,7 @@ import hashlib
 from datetime import datetime
 
 # 1. SETUP
-st.set_page_config(page_title="Upload Laporan OSP", page_icon="🛡️")
+st.set_page_config(page_title="Portal Laporan OSP", page_icon="🛡️")
 
 def calculate_hash(file):
     sha256_hash = hashlib.sha256()
@@ -26,7 +26,7 @@ def save_to_log(pilihan, bulan, file_name, file_hash):
 # --- SIDEBAR ---
 menu = st.sidebar.radio("Menu:", ["📤 Upload Vendor", "📊 Admin Panel"])
 
-# --- HALAMAN UPLOAD (DISEDERHANAKAN) ---
+# --- HALAMAN UPLOAD ---
 if menu == "📤 Upload Vendor":
     st.title("🛡️ Portal Laporan OSP")
     
@@ -40,13 +40,13 @@ if menu == "📤 Upload Vendor":
         with col2:
             segmen = st.selectbox("Pilih Segmen:", opsi_segmen)
 
-        # File uploader tanpa Form (Langsung Proses)
-        file_pdf = st.file_uploader("Upload PDF Timemark di sini:", type=["pdf"])
+        # SEKARANG MENDUKUNG PDF DAN EXCEL
+        file_input = st.file_uploader("Upload Laporan (PDF atau Excel):", type=["pdf", "xlsx", "xls", "csv"])
 
-        if file_pdf is not None:
-            current_hash = calculate_hash(file_pdf)
+        if file_input is not None:
+            current_hash = calculate_hash(file_input)
             
-            # Cek Duplikat Isi
+            # Cek Duplikat Isi (Hashing)
             is_dup = False
             if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
                 log_df = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
@@ -54,20 +54,25 @@ if menu == "📤 Upload Vendor":
                     is_dup = True
 
             if is_dup:
-                st.error("❌ File ini sudah pernah diupload sebelumnya. Harap gunakan foto terbaru!")
+                st.error("❌ GAGAL: File dengan isi yang sama sudah pernah diupload! Harap gunakan data terbaru.")
             else:
-                if st.button("KONFIRMASI KIRIM"): # Satu klik terakhir untuk kepastian
+                if st.button("KONFIRMASI KIRIM"):
                     if not os.path.exists("uploads"): os.makedirs("uploads")
-                    fname = f"{bulan.upper()}_{segmen.replace(' ', '_')}.pdf"
+                    
+                    # Ambil ekstensi asli file (agar tidak berubah jadi .pdf semua)
+                    ext = os.path.splitext(file_input.name)[1]
+                    fname = f"{bulan.upper()}_{segmen.replace(' ', '_')}{ext}"
+                    
                     with open(os.path.join("uploads", fname), "wb") as f:
-                        f.write(file_pdf.getbuffer())
+                        f.write(file_input.getbuffer())
+                    
                     save_to_log(segmen, bulan, fname, current_hash)
-                    st.success(f"✅ Berhasil Terkirim!")
+                    st.success(f"✅ Berhasil! File {ext} telah tersimpan.")
                     st.balloons()
     except:
         st.error("File GPSFIBEROP.xlsx tidak ditemukan!")
 
-# --- HALAMAN ADMIN (TETAP AMAN) ---
+# --- HALAMAN ADMIN ---
 elif menu == "📊 Admin Panel":
     st.title("🔐 Admin Area")
     if st.text_input("Password:", type="password") == "indosat2024":
@@ -85,5 +90,3 @@ elif menu == "📊 Admin Panel":
                     if c3.button("🗑️", key=f"del{i}"):
                         os.remove(os.path.join("uploads", f))
                         st.rerun()
-        else:
-            st.info("Belum ada data.")
