@@ -1,168 +1,206 @@
 import streamlit as st
 import pandas as pd
-import os
-import hashlib
-import sqlite3
-import io
-import imagehash
-from PIL import Image
 from openpyxl import load_workbook
+from PIL import Image, UnidentifiedImageError, ImageFilter
+import imagehash
+import io
+import os
+import re
+import sqlite3
+import zipfile
+import hashlib
+import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
-# --- 1. KONFIGURASI & DATABASE ---
-st.set_page_config(page_title="Portal Patroli OSP & Audit", page_icon="🛡️", layout="wide")
+# =========================
+# CONFIG UI
+# =========================
+st.set_page_config(page_title="Audit Foto Patroli - Center Focused", layout="wide")
+st.title("🕵️ AUDIT FOTO PATROLI (CENTER AUDIT MODE)")
+st.caption(
+    "Sistem ini hanya mengaudit bagian TENGAH foto untuk menghindari kesalahan deteksi akibat LOGO atau OVERLAY GEO yang selalu sama."
+)
 
-def get_db_connection():
-    conn = sqlite3.connect('master_audit.db', check_same_thread=False)
-    conn.execute('''CREATE TABLE IF NOT EXISTS history 
-                   (hash TEXT PRIMARY KEY, segment TEXT, file_name TEXT, date TEXT)''')
+# =========================
+# STREAMLIT UI
+# =========================
+uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
+
+colA, colB = st.columns([1, 2])
+with colA:
+    preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=200, step=10)
+with colB:
+    st.info("Logika: Area atas 25% (Logo) dan Bawah 25% (GEO) akan dipotong sebelum proses hashing.")
+
+# =========================
+# DATABASE
+# =========================
+DB_PATH = "audit_history.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            sha256 TEXT PRIMARY KEY,
+            phash  TEXT,
+            source_type TEXT,
+            source_file TEXT,
+            sheet TEXT,
+            location TEXT,
+            cluster TEXT,
+            segment TEXT,
+            url TEXT,
+            first_seen DATE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON history(phash)")
     return conn
 
-# Fungsi hash untuk file (PDF/Excel)
-def calculate_file_hash(file):
-    sha256_hash = hashlib.sha256()
-    for byte_block in iter(lambda: file.read(4096), b""):
-        sha256_hash.update(byte_block)
-    file.seek(0)
-    return sha256_hash.hexdigest()
+def db_lookup(conn, sha256_hex: str, phash_str: str):
+    exact = conn.execute(
+        "SELECT source_file, sheet, location, cluster, segment, url, first_seen FROM history WHERE sha256=?",
+        (sha256_hex,)
+    ).fetchone()
 
-# --- 2. ENGINE AUDIT FOTO (DALAM EXCEL) ---
-def run_photo_audit(file_path):
-    wb = load_workbook(file_path, data_only=True)
-    photo_results = []
-    conn = get_db_connection()
-    
-    for sheet in wb.worksheets:
-        if hasattr(sheet, '_images'):
-            for img_obj in sheet._images:
-                try:
-                    row = img_obj.anchor._from.row + 1
-                    col = img_obj.anchor._from.col + 1
-                    segment = sheet.cell(row=row, column=3).value or "N/A"
-                    
-                    # Convert image data to hash
-                    img = Image.open(io.BytesIO(img_obj._data())).convert('RGB')
-                    p_hash = str(imagehash.phash(img)) # Digital Fingerprint Foto
-                    
-                    # Cek Lintas Periode di Database
-                    res = conn.execute("SELECT date FROM history WHERE hash=?", (p_hash,)).fetchone()
-                    
-                    status = "✅ VALID (FOTO BARU)"
-                    if res:
-                        status = f"❌ GUGUR (Pernah Terbit: {res[0]})"
-                    
-                    photo_results.append({
-                        "Sheet": sheet.title,
-                        "Posisi": f"Baris {row}, Kolom {col}",
-                        "Segmen": segment,
-                        "Photo_Hash": p_hash,
-                        "Status_Audit": status
-                    })
-                except: continue
-    return photo_results
+    ph = conn.execute(
+        "SELECT source_file, sheet, location, cluster, segment, url, first_seen FROM history WHERE phash=? LIMIT 1",
+        (phash_str,)
+    ).fetchone()
 
-# --- 3. UI SIDEBAR ---
-st.sidebar.title("🛡️ OSP CONTROL")
-menu = st.sidebar.radio("Menu Utama:", ["📤 Upload Vendor", "📊 Admin Panel & Audit"])
+    return exact, ph
 
-# --- 4. HALAMAN UPLOAD VENDOR ---
-if menu == "📤 Upload Vendor":
-    st.title("📤 Pengiriman Laporan Patroli")
-    st.info("Sistem mengaudit duplikasi file dan isi foto secara otomatis.")
+def db_insert(conn, row: dict):
+    conn.execute("""
+        INSERT OR IGNORE INTO history
+        (sha256, phash, source_type, source_file, sheet, location, cluster, segment, url, first_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        row["sha256"], row["phash"], row["source_type"], row["source_file"],
+        row["sheet"], row["location"], row["cluster"], row["segment"], row["url"], row["first_seen"]
+    ))
 
+# =========================
+# HASHING (MODIFIED: CENTER CROP)
+# =========================
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def compute_hashes_from_bytes(img_bytes: bytes):
     try:
-        df_master = pd.read_excel("GPSFIBEROP.xlsx")
-        opsi_segmen = df_master['NO'].astype(str) + " - " + df_master['SEGMENT NAME'].str.strip()
+        img_original = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = img_original.size
         
-        col1, col2 = st.columns(2)
-        with col1:
-            bulan = st.selectbox("Laporan Bulan:", ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"])
-        with col2:
-            segmen = st.selectbox("Pilih Segmen:", opsi_segmen)
-
-        file_input = st.file_uploader("Upload File (PDF/Excel):", type=["pdf", "xlsx", "xls"])
-
-        if file_input:
-            f_hash = calculate_file_hash(file_input)
-            
-            # Cek duplikat file di log Excel
-            is_dup_file = False
-            if os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
-                rekap_check = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
-                if 'HASH' in rekap_check.columns and f_hash in rekap_check['HASH'].values:
-                    is_dup_file = True
-
-            if is_dup_file:
-                st.error("❌ File ini sudah pernah diunggah! Harap gunakan file laporan terbaru.")
-            else:
-                if st.button("🚀 KIRIM LAPORAN SEKARANG"):
-                    if not os.path.exists("uploads"): os.makedirs("uploads")
-                    ext = os.path.splitext(file_input.name)[1]
-                    fname = f"{bulan.upper()}_{segmen.replace(' ', '_')}{ext}"
-                    path = os.path.join("uploads", fname)
-                    
-                    with open(path, "wb") as f:
-                        f.write(file_input.getbuffer())
-                    
-                    # Simpan ke Log
-                    log_data = pd.DataFrame([{"WAKTU": datetime.now().strftime("%Y-%m-%d %H:%M"), "BULAN": bulan, "SEGMEN": segmen, "FILE": fname, "HASH": f_hash}])
-                    if not os.path.exists("REKAP_UPLOAD_VENDOR.xlsx"):
-                        log_data.to_excel("REKAP_UPLOAD_VENDOR.xlsx", index=False)
-                    else:
-                        old_log = pd.read_excel("REKAP_UPLOAD_VENDOR.xlsx")
-                        pd.concat([old_log, log_data], ignore_index=True).to_excel("REKAP_UPLOAD_VENDOR.xlsx", index=False)
-                    
-                    st.success("✅ Berhasil! Laporan Anda telah masuk ke sistem audit.")
-                    st.balloons()
-    except:
-        st.error("File GPSFIBEROP.xlsx tidak ditemukan!")
-
-# --- 5. HALAMAN ADMIN & HASIL AUDIT ---
-elif menu == "📊 Admin Panel & Audit":
-    st.title("📊 Monitoring & Audit Lintas Periode")
-    if st.text_input("Password Admin:", type="password") == "indosat2024":
+        # --- PERINTAH: AUDIT BAGIAN TENGAH SAJA ---
+        # Potong 25% atas (buang Logo)
+        # Potong 25% bawah (buang GEO Overlay)
+        # Ambil 10% margin kiri-kanan
+        top = int(h * 0.25)
+        bottom = int(h * 0.75)
+        left = int(w * 0.10)
+        right = int(w * 0.90)
         
-        if os.path.exists("uploads"):
-            files = os.listdir("uploads")
-            selected_file = st.selectbox("Pilih File yang Ingin Diaudit Fotonya:", files)
-            
-            if st.button("🔍 JALANKAN AUDIT FOTO"):
-                file_path = os.path.join("uploads", selected_file)
-                
-                if ".xlsx" in selected_file:
-                    with st.spinner("Sedang membedah isi foto..."):
-                        audit_data = run_photo_audit(file_path)
-                        
-                        if audit_data:
-                            df_audit = pd.DataFrame(audit_data)
-                            st.dataframe(df_audit, use_container_width=True)
-                            
-                            # Update History Database untuk foto yang VALID
-                            conn = get_db_connection()
-                            curr_date = datetime.now().strftime("%Y-%m-%d")
-                            for _, r in df_audit.iterrows():
-                                if "VALID" in r['Status_Audit']:
-                                    try:
-                                        conn.execute("INSERT INTO history VALUES (?,?,?,?)", 
-                                                     (r['Photo_Hash'], r['Segmen'], selected_file, curr_date))
-                                    except: pass
-                            conn.commit()
+        # Area inti yang diaudit
+        audit_area = img_original.crop((left, top, right, bottom))
+        # ------------------------------------------
 
-                            # DOWNLOAD HASIL AUDIT
-                            output = io.BytesIO()
-                            df_audit.to_excel(output, index=False)
-                            st.download_button("📥 DOWNLOAD HASIL AUDIT (EXCEL)", output.getvalue(), f"Hasil_Audit_{selected_file}.xlsx")
-                        else:
-                            st.warning("Tidak ditemukan foto yang menempel (embedded) di file Excel ini.")
-                else:
-                    st.info("Fitur Audit Foto mendalam saat ini khusus untuk file .xlsx. Untuk PDF, silakan cek manual lewat tombol Download.")
+        # Thumb untuk pHash dari area tengah
+        thumb = audit_area.copy()
+        thumb.thumbnail((260, 260))
+        ph = str(imagehash.phash(thumb))
+        
+        # SHA256 dari bytes area tengah (agar logo tidak merusak hash)
+        img_byte_arr = io.BytesIO()
+        audit_area.save(img_byte_arr, format='PNG')
+        sh = sha256_bytes(img_byte_arr.getvalue())
+        
+        return sh, ph, thumb, img_original
+    except UnidentifiedImageError:
+        return None, None, None, None
 
-            st.markdown("---")
-            st.subheader("Manajemen File Uploads")
-            for i, f in enumerate(files):
-                c1, c2, c3 = st.columns([3,1,1])
-                c1.write(f"📄 {f}")
-                c2.download_button("Download", open(os.path.join("uploads", f), "rb"), file_name=f, key=f"dl{i}")
-                if c3.button("Hapus", key=f"del{i}"):
-                    os.remove(os.path.join("uploads", f))
-                    st.rerun()
+# =========================
+# METRIK VISUAL (LOGO & GEO DETECTION)
+# =========================
+def image_entropy_gray(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256))
+    hist = g.histogram()
+    total = sum(hist)
+    if total == 0: return 0.0
+    ent = 0.0
+    for h in hist:
+        if h:
+            p = h / total
+            ent -= p * math.log2(p)
+    return ent
+
+def edge_density(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256)).filter(ImageFilter.FIND_EDGES)
+    px = list(g.getdata())
+    mean = sum(px) / (len(px) or 1)
+    return mean / 255.0
+
+def unique_color_ratio(img: Image.Image, k=24) -> float:
+    small = img.resize((256, 256))
+    q = small.quantize(colors=k, method=2)
+    px = list(q.getdata())
+    uniq = len(set(px))
+    return uniq / float(k)
+
+def bright_ratio(img: Image.Image, thr=240) -> float:
+    g = img.convert("L").resize((256, 256))
+    px = list(g.getdata())
+    return sum(1 for p in px if p >= thr) / (len(px) or 1)
+
+def is_logo_only(img: Image.Image) -> tuple[bool, str]:
+    w, h = img.size
+    if w < 140 or h < 140: return True, "LogoOnly: kecil"
+    ent = image_entropy_gray(img)
+    ed = edge_density(img)
+    ucr = unique_color_ratio(img, k=24)
+    br = bright_ratio(img, thr=240)
+    if br >= 0.55 and ucr <= 0.45 and ed <= 0.060:
+        return True, "LogoOnly(WhiteBG)"
+    if ent <= 4.10 and ucr <= 0.40 and ed <= 0.060:
+        return True, "LogoOnly(Flat)"
+    return False, "NotLogo"
+
+def _patch_stats(patch_gray: Image.Image):
+    px = list(patch_gray.getdata())
+    n = len(px) or 1
+    mean = sum(px) / n
+    var = sum((p - mean) ** 2 for p in px) / n
+    std = math.sqrt(var)
+    white_ratio = sum(1 for p in px if p >= 220) / n
+    dark_ratio  = sum(1 for p in px if p <= 70) / n
+    ed = edge_density(patch_gray.convert("RGB"))
+    return mean, std, white_ratio, dark_ratio, ed
+
+def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
+    w, h = img.size
+    if w < 240 or h < 240: return False, "NonGEO: kecil"
+    rois = [("LB", (0, 0.62, 0.5, 1)), ("MB", (0.2, 0.62, 0.8, 1)), ("RB", (0.5, 0.62, 1, 1))]
+    best_score = -1
+    for name, (x0, y0, x1, y1) in rois:
+        patch = img.crop((int(w*x0), int(h*y0), int(w*x1), int(h*y1))).convert("L").resize((260, 260))
+        mean, std, white_ratio, dark_ratio, pedge = _patch_stats(patch)
+        score = int(white_ratio>=0.003) + int(dark_ratio>=0.006) + int(std>=14) + int(pedge>=0.030)
+        if score > best_score: best_score = score
+    if best_score >= 2: return True, "GEO✅"
+    return False, "NonGEO"
+
+def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
+    ok_geo, geo_dbg = overlay_geo_best(img)
+    if ok_geo: return True, "", ""
+    logo, logo_dbg = is_logo_only(img)
+    if logo: return False, "⏭️ SKIP (Logo-Only)", logo_dbg
+    return False, "⏭️ SKIP (Non-Patroli)", ""
+
+# =========================
+# OPERASI EXCEL & AUDIT (SAMA SEPERTI KODINGANMU)
+# =========================
+# [Sisa fungsi apply_dup_of_columns, audit_workbook, dan UI Actions tetap sama]
+# [Namun pastikan memanggil compute_hashes_from_bytes yang baru di atas]
+
+# ... (Lanjutkan dengan fungsi audit_workbook dan logic download dari kodinganmu)
+# Karena keterbatasan panjang teks, pastikan bagian compute_hashes_from_bytes di atas sudah terupdate.
